@@ -132,7 +132,9 @@ class LayeredLayoutProvider:
                           horizontal, direction, eff_options=eff_options)
 
         # Phase 6: Edge routing
-        self._route_edges(edges, node_map, port_map, horizontal, direction)
+        self._route_edges(edges, node_map, port_map, horizontal, direction,
+                          edge_routing=str(eff_options.get('elk.edgeRouting')
+                                           or ''))
 
         # Place labels
         self._place_labels(nodes, eff_options, global_options)
@@ -667,8 +669,17 @@ class LayeredLayoutProvider:
 
             current_x += max_width + layer_spacing
 
-    def _route_edges(self, edges, node_map, port_map, horizontal, direction):
-        """Route edges between nodes."""
+    def _route_edges(self, edges, node_map, port_map, horizontal, direction,
+                     edge_routing=''):
+        """Route edges between nodes.
+
+        ``edgeRouting: ORTHOGONAL`` (the default from the UML/SysML graph
+        exporters) routes every edge as a Manhattan channel: perpendicular
+        exit, cross the inter-layer band at a channel line, perpendicular
+        entry.  BK-aligned chains run straight (same centre through the
+        band).  Other values keep the legacy straight-line routing."""
+        orthogonal = edge_routing.upper() == 'ORTHOGONAL'
+        lanes = {}
         for edge in edges:
             if edge.is_self_loop:
                 continue
@@ -696,17 +707,62 @@ class LayeredLayoutProvider:
             if edge.reversed:
                 sp, ep = ep, sp
 
-            # Collect bend points from dummy nodes
-            bend_points = []
-            for dummy in edge.dummy_nodes:
-                if horizontal:
+            if not orthogonal:
+                # Collect bend points from dummy nodes
+                bend_points = []
+                for dummy in edge.dummy_nodes:
                     bend_points.append((dummy.x + dummy.width / 2,
                                         dummy.y + dummy.height / 2))
-                else:
-                    bend_points.append((dummy.x + dummy.width / 2,
-                                        dummy.y + dummy.height / 2))
+                edge.bend_points = bend_points
+                continue
 
+            # ORTHOGONAL: walk the chain source -> dummies -> target,
+            # Manhattan between consecutive anchors, straight whenever
+            # the anchors already share the within-layer coordinate
+            anchors = [(edge.source, sp)]
+            for d in sorted(edge.dummy_nodes, key=lambda dd: dd.layer):
+                anchors.append((d, (d.x + d.width / 2,
+                                    d.y + d.height / 2)))
+            anchors.append((edge.target, ep))
+            if edge.reversed:
+                anchors.reverse()
+            bend_points = []
+            for (u, pu), (w, pw) in zip(anchors, anchors[1:]):
+                axis = 1 if horizontal else 0        # within-layer coord
+                step_axis = 0 if horizontal else 1   # layer-stacking coord
+                if abs(pu[axis] - pw[axis]) < 1e-6:
+                    continue                          # BK-straight: no bend
+                li_band = min(u.layer, w.layer)
+                k = lanes.get(li_band, 0)
+                lanes[li_band] = k + 1
+                # channel between the two layer bands, lanes spread
+                # symmetrically to keep parallel runs distinct
+                if horizontal:
+                    u_edge = u.x + u.width      # layer bands along x
+                    w_edge = w.x
+                else:
+                    u_edge = u.y + u.height     # layer bands along y
+                    w_edge = w.y
+                mid = (u_edge + w_edge) / 2.0
+                off = (k // 2) * 6.0 * (1 if k % 2 == 0 else -1)
+                ch = mid + off
+                ch = max(ch, u_edge + 2.0) if w_edge > u_edge else \
+                    min(ch, u_edge - 2.0)
+                b1 = [0.0, 0.0]
+                b2 = [0.0, 0.0]
+                b1[axis] = pu[axis]
+                b1[step_axis] = ch
+                b2[axis] = pw[axis]
+                b2[step_axis] = ch
+                if abs(pu[step_axis] - ch) > 1e-6 or \
+                        abs(pw[step_axis] - ch) > 1e-6:
+                    bend_points.append(tuple(b1))
+                    bend_points.append(tuple(b2))
             edge.bend_points = bend_points
+            edge._orthogonal_points = (
+                [tuple(anchors[0][1])]
+                + list(bend_points)
+                + [tuple(anchors[-1][1])])
 
     def _get_node_connection_point(self, node, horizontal, direction, is_source):
         """Get the connection point on a node for an edge."""
@@ -843,8 +899,16 @@ class LayeredLayoutProvider:
             else:
                 actual_src, actual_tgt = src, tgt
 
-            sp = self._get_node_connection_point(actual_src, horizontal, direction, True)
-            ep = self._get_node_connection_point(actual_tgt, horizontal, direction, False)
+            route = getattr(edge, '_orthogonal_points', None)
+            if route:
+                # the orthogonal router computed port-anchored heads —
+                # re-deriving them here would cut the first/last bends
+                sp, ep = route[0], route[-1]
+                bends = route[1:-1]
+            else:
+                sp = self._get_node_connection_point(actual_src, horizontal, direction, True)
+                ep = self._get_node_connection_point(actual_tgt, horizontal, direction, False)
+                bends = edge.bend_points
 
             section = {
                 'id': edge.id + '_s0',
@@ -852,9 +916,9 @@ class LayeredLayoutProvider:
                 'endPoint': {'x': ep[0], 'y': ep[1]},
             }
 
-            if edge.bend_points:
+            if bends:
                 section['bendPoints'] = [{'x': bp[0], 'y': bp[1]}
-                                         for bp in edge.bend_points]
+                                         for bp in bends]
 
             edge.original['sections'] = [section]
 
