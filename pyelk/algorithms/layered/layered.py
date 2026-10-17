@@ -15,6 +15,7 @@ from ...options import (
     get_option, get_padding, get_spacing, get_direction,
     resolve_option_key, get_effective_options
 )
+from .brandes_kozen import align_and_pack as _bk_align_and_pack
 from ...exceptions import UnsupportedConfigurationException
 
 
@@ -127,7 +128,8 @@ class LayeredLayoutProvider:
 
         # Phase 5: Node placement
         horizontal = direction in ('RIGHT', 'LEFT')
-        self._place_nodes(layers, node_spacing, layer_spacing, padding, horizontal, direction)
+        self._place_nodes(layers, node_spacing, layer_spacing, padding,
+                          horizontal, direction, eff_options=eff_options)
 
         # Phase 6: Edge routing
         self._route_edges(edges, node_map, port_map, horizontal, direction)
@@ -549,15 +551,67 @@ class LayeredLayoutProvider:
         layer.sort(key=lambda n: barycenters.get(n.id, float('inf')))
 
     def _place_nodes(self, layers, node_spacing, layer_spacing, padding,
-                     horizontal, direction):
-        """Place nodes, assigning x/y coordinates."""
+                     horizontal, direction, eff_options=None):
+        """Place nodes, assigning x/y coordinates.
+
+        ``elk.layered.nodePlacement.strategy`` 'BRANDES_KOZEN' (alias
+        'BRANDES') selects the Brandes-Köpnig coordinate assignment; any
+        other value keeps the centred stacking fallback."""
         if not layers:
             return
-
-        if horizontal:
-            self._place_horizontal(layers, node_spacing, layer_spacing, padding, direction)
+        eff_options = eff_options or {}
+        strategy = str(eff_options.get('elk.layered.nodePlacement.strategy') or
+                       eff_options.get('nodePlacement.strategy') or 'SIMPLE')
+        if 'BRANDES' in strategy.upper():
+            self._place_brandes_kozen(layers, node_spacing, layer_spacing,
+                                      padding, horizontal, direction)
+        elif horizontal:
+            self._place_horizontal(layers, node_spacing, layer_spacing,
+                                   padding, direction)
         else:
-            self._place_vertical(layers, node_spacing, layer_spacing, padding, direction)
+            self._place_vertical(layers, node_spacing, layer_spacing,
+                                 padding, direction)
+
+    def _place_brandes_kozen(self, layers, node_spacing, layer_spacing,
+                             padding, horizontal, direction):
+        all_nodes = [n for layer in layers for n in layer]
+        if not all_nodes:
+            return
+        chains = self._bk_chains(all_nodes)
+        placed = _bk_align_and_pack(layers, all_nodes, chains, node_spacing,
+                                    layer_spacing, padding, horizontal)
+        for n in all_nodes:
+            half = (n.width if not horizontal else n.height) / 2.0
+            if horizontal:
+                # RIGHT/LEFT: layers march along x, within-layer is y
+                n.x, n.y = (placed['along'][id(n)] - half,
+                            placed['step'][id(n)] - n.height / 2.0)
+            else:
+                # DOWN/UP: layers march along y, within-layer is x; the
+                # BK step coordinate is a node CENTRE — convert to the
+                # top-left origin the write-back machinery expects
+                n.x = placed['step'][id(n)] - n.width / 2.0
+                n.y = placed['along'][id(n)]
+
+    def _bk_chains(self, all_nodes):
+        """Per-edge node chains (source -> dummies -> target) ordered by
+        layer, as ((layer, node), ...) tuples for the BK assigner."""
+        chains = []
+        for e in self._bk_edges(all_nodes):
+            if e.is_self_loop:
+                continue
+            chain = ([e.source]
+                     + sorted(e.dummy_nodes, key=lambda d: d.layer)
+                     + [e.target])
+            chains.append([(n.layer, n) for n in chain])
+        return chains
+
+    def _bk_edges(self, all_nodes):
+        edges = set()
+        for n in all_nodes:
+            edges.update(n.incoming)
+            edges.update(n.outgoing)
+        return edges
 
     def _place_vertical(self, layers, node_spacing, layer_spacing, padding, direction):
         """Place nodes for DOWN/UP direction."""
