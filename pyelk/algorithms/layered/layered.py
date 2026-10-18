@@ -77,7 +77,15 @@ class LEdge:
 
 
 class LayeredLayoutProvider:
-    """Implements Sugiyama's layered layout algorithm."""
+    """Implements Sugiyama's layered layout algorithm.
+
+    Phases: cycle breaking, layering, dummy insertion, crossing
+    minimisation, node placement (:meth:`_place_nodes` — centred
+    stacking or Brandes-Köpnig per ``elk.layered.nodePlacement.strategy``,
+    see ``brandes_kozen.py`` and ``docs/brandes_kozen.md``) and edge
+    routing (:meth:`_route_edges`, straight-legacy or Manhattan per
+    ``elk.edgeRouting``).
+    """
 
     def layout(self, graph: dict, global_options: dict = None) -> None:
         """Layout the graph using the layered algorithm."""
