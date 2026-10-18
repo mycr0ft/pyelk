@@ -1,17 +1,69 @@
 """Brandes-Köpnig horizontal coordinate assignment.
 
 ELK layered ``nodePlacement.strategy = BRANDES_KOZEN`` (alias accepted:
-``BRANDES``).  Four vertical-alignment scans (align up/down x traverse
-left/right) greedily build non-crossing alignment chains over edge-chain
-segments (source -> dummy nodes -> target), resolving conflicts by
-endpoint degree (segments with a higher combined degree steal the slot).
-Each scan then packs the chains so every node in a chain shares one
-centre — long edges run straight through their dummy nodes — using
-per-layer cursors so nothing overlaps.  The scan with the smallest total
-width wins; ties prefer more aligned segments.  Deterministic.
+``BRANDES``).  This is phase 5 of the Sugiyama pipeline: after layering
+and crossing minimisation have fixed the ORDER of nodes within each
+layer, this decides the coordinates.  The naive alternative — centring
+each layer independently — misaligns edge chains whenever neighbouring
+layers differ in total width and staircase routes appear.  Köpnig's
+phrase for the goal is "draw as many edges straight as possible".
 
-Reference: Ulrik Brandes and Boris Köpnig, "Fast and Simple Horizontal
-Coordinate Assignment", in DAG Drawing: Beyond Layered Approach (2002).
+Algorithm overview (four passes — align up/down x traverse left/right;
+the pass whose layout is narrowest wins, ties prefer more aligned
+segments):
+
+1.  Vertical alignment.  For every node v, its median adjacent-layer
+    neighbour w offers a block to join.  v joins w's block only if both
+    are free (neither already carries an alignment in this pass) and the
+    alignment does not CROSS an already-built chain: all chains aligned
+    left (right) of v must place their aligned neighbour left (right) of
+    w.  A crossing is resolved by endpoint degree: a candidate whose
+    combined endpoint degree exceeds the incumbent's steals the slot.
+    Chains = maximal paths through the accepted alignments; every node
+    of a chain will share one x-centre later, so the chain's edges run
+    vertical.
+
+2.  Horizontal compaction.  Blocks are laid out in traversal order with
+    per-layer position cursors: the block's shared centre is
+    max(desired median of already-packed neighbour centres, feasible
+    minimum from the cursors).  Cursor packing replaces the paper's
+    unit-delta compaction — deliberate, because that compaction is where
+    the original publication's two known errors live; both are
+    documented (and corrected) in the arXiv erratum, and the cursor
+    formulation is immune to both while keeping O(N) runtime.
+
+3.  Balancing.  The four candidate layouts are compared by total extent,
+    tie-broken by the count of nodes that had neighbours but could not
+    align (a proxy for stray edge bends).
+
+Deviations from the published pseudocode (all deliberate):
+
+-  vertices carry real sizes — compaction uses half-width margins rather
+   than the unit-delta bookkeeping;
+-  Sugiyama long-edge DUMMY NODES are first-class chain members, so an
+   aligned chain straightens the entire long edge through all its
+   dummy layers;
+-  everything is deterministic (sorted candidate orders, stable
+   tie-breaks) so repeated layouts are byte-identical;
+-  the orthogonal edge ROUTING is a separate phase (see
+   ``LayeredLayoutProvider._route_edges`` with ``elk.edgeRouting:
+   ORTHOGONAL``): aligned chains need no bends and untouched edges cross
+   the inter-layer bands on per-band channel lanes.
+
+References:
+
+-  Ulrik Brandes and Boris Köpnig, "Fast and Simple Horizontal
+   Coordinate Assignment", Proc. 9th Int. Symp. Graph Drawing (GD 2001),
+   LNCS 2265, pp. 31-44, Springer, 2002.
+   https://doi.org/10.1007/3-540-45848-4_3
+-  Ulrik Brandes, Julian Walter, Johannes Zink, "Erratum: Fast and
+   Simple Horizontal Coordinate Assignment", 2020 (documents the two
+   flaws in the original compaction pseudocode).
+   https://arxiv.org/abs/2008.01252
+-  "Size- and Port-Aware Horizontal Node Coordinate Assignment", GD 2015
+   (varying node sizes and fixed ports with BK).
+   https://link.springer.com/chapter/10.1007/978-3-319-27261-0_12
+-  Full method notes: docs/brandes_kozen.md in this repository.
 """
 
 from collections import defaultdict
@@ -75,12 +127,28 @@ def _neighbours(layers, chains):
 
 
 def _scan(layers, positions, nbr, degree, adj, within):
-    """One vertical-alignment pass; returns (segments, unaligned_count).
+    """Vertical-alignment pass (paper Alg. 1, size/degree adapted).
 
-    ``segments`` = list of ((layer_i, u), (layer_j, w)) with
-    |li - lj| == 1.  A candidate crossing an already-aligned segment is
-    dropped unless its combined endpoint degree is strictly higher (then
-    it steals the slot)."""
+    ``adj`` selects which adjacent layer to align towards ('down' =
+    the layer below, traversed top-to-bottom; 'up' = the layer above,
+    traversed bottom-to-top); ``within`` is the traversal order inside
+    each layer and decides which of the two even-count median
+    candidates is tried first.
+
+    For every node the candidates are its median adjacent-layer
+    neighbours (odd count: one; even: the two around the median, tried
+    in traversal preference with fallback to the second).  An alignment
+    (u, w) succeeds when neither endpoint is already aligned in this
+    pass and the segment does not CROSS an accepted segment within the
+    same layer pair (crossing = opposite position order in the two
+    layers).  A crossed candidate with strictly higher combined endpoint
+    degree steals the slot from each incumbent it crosses.
+
+    Returns (segments, unaligned_count) where ``segments`` is a list of
+    ((layer_i, u), (layer_j, w)) with |li - lj| == 1 and
+    ``unaligned_count`` counts nodes that had neighbours but ended the
+    pass without an alignment (the balancing tie-break proxy for stray
+    bends)."""
     adj_off = 1 if adj == 'down' else -1
     layer_order = (list(range(len(layers))) if adj == 'down'
                    else list(range(len(layers) - 1, -1, -1)))
@@ -152,8 +220,13 @@ def _scan(layers, positions, nbr, degree, adj, within):
 
 
 def _crosses(seg, other, positions):
-    """Two segments spanning the SAME adjacent-layer pair cross when
-    their position orders disagree between the two layers."""
+    """Would aligning ``seg`` conflict with already-aligned ``other``?
+
+    Two segments spanning the SAME adjacent-layer pair conflict when
+    their endpoint position orders disagree between the two layers
+    (paper step 1's crossing condition).  Segments over different layer
+    pairs never conflict here — layer cursors in the compaction step
+    resolve those by space, not by order."""
     (la1, a1), (la2, a2) = seg
     (lb1, b1), (lb2, b2) = other
     if {la1, la2} != {lb1, lb2} or la1 == la2:
@@ -177,10 +250,17 @@ def _crosses(seg, other, positions):
 
 
 def _build_chains(layers, segs):
-    """Chains = maximal alignment paths over the segment set.  Within one
-    scan every node belongs to at most one segment, so paths are simple;
-    process nodes in layer order so each path is assembled from its
-    topmost node."""
+    """Chains = maximal alignment paths over the segment set.
+
+    Because one scan grants every node at most one alignment (per
+    side), the segment set forms disjoint simple paths across
+    consecutive layers.  Walking nodes in layer order means each path
+    is assembled starting from its topmost node — a node whose upper
+    partner was already consumed by an earlier walk gets absorbed
+    there.  These chains become the blocks of the compaction step; all
+    members of one chain share a centre, which is what renders the
+    chain's edges vertical and straightens a Sugiyama long edge through
+    all of its dummy layers."""
     nxt = defaultdict(dict)      # id(node) -> {layer: other node}
     for (li, v), (lj, w) in segs:
         nxt[id(v)][lj] = w
@@ -216,7 +296,25 @@ def _build_chains(layers, segs):
 
 
 def _pack(layers, segs, node_spacing, layer_spacing, padding, horizontal):
-    """Cursor-based packing; chains share one centre x (or y)."""
+    """Horizontal compaction (paper Alg. 2/3, cursor formulation).
+
+    Chains from :func:`_build_chains` are placed in traversal order
+    (topmost layer first, then leftmost member).  Each chain receives
+    ONE shared centre x (or y for RIGHT/LEFT layouts): the larger of
+
+    - the median of its members' already-placed partner centres (the
+      median rule of the paper), and
+    - the feasible minimum from the per-layer cursors
+      (cursor + node_spacing + half member extent), which guarantees no
+      two nodes overlap regardless of differing node sizes.
+
+    Replacing the paper's unit-delta absolute-coordinate recursion with
+    cursors sidesteps the two errors documented in the arXiv erratum
+    (the type-2/type-3 conflict bookkeeping and the place_block
+    recursion's sink update) while keeping linear time.  Unaligned
+    nodes pack as singleton chains; the 'along' axis stacks layers
+    exactly like the centred fallback pass so only phase-5 behaviour
+    differs."""
     step = {}
     along = {}
 

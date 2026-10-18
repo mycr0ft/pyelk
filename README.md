@@ -369,6 +369,9 @@ EPL-2.0 (same as ELK)
 
 ### nodePlacement.strategy (layered)
 
+Method notes, algorithm walk-through and references:
+[docs/brandes_kozen.md](docs/brandes_kozen.md).
+
 `BRANDES_KOZEN` (alias `BRANDES`) is implemented since 0.3.1:
 Brandes–Köpnig horizontal coordinate assignment — four vertical-alignment
 scans build non-crossing alignment chains (long edges straighten through

@@ -576,6 +576,17 @@ class LayeredLayoutProvider:
 
     def _place_brandes_kozen(self, layers, node_spacing, layer_spacing,
                              padding, horizontal, direction):
+        """Phase-5 placement via Brandes-Köpnig coordinate assignment.
+
+        Strategy BRANDES_KOZEN of the ELK layered algorithm (alias
+        'BRANDES').  Four vertical-alignment scans over the edge chains
+        (source -> dummy nodes -> target) build non-crossing chains;
+        each chain is packed to a single shared centre so its edges run
+        straight, guarded by per-layer cursors against overlap.  The
+        narrowest scan wins.  Method notes, deviations from the printed
+        pseudocode and the references (original LNCS 2265 paper + the
+        arXiv erratum) live in ``docs/brandes_kozen.md`` and the
+        ``brandes_kozen`` module docstring."""
         all_nodes = [n for layer in layers for n in layer]
         if not all_nodes:
             return
